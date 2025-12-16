@@ -23,6 +23,7 @@ from app.database.models import OpenAIArticle, AnthropicArticle, YouTubeVideo, A
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
 # --- Configuration ---
 SYSTEM_PROMPT = """
 You are an expert AI news analyst specializing in summarizing technical articles, research papers, and video content about artificial intelligence.

@@ -127,3 +127,33 @@ class Repository:
             self.session.commit()
             return True
         return False
+    def update_impact_score(self, summary_id: int, score: int) -> bool:
+        """
+        Updates the impact_score for a specific article summary.
+        """
+        summary_item = self.session.query(ArticleSummary).filter_by(id=summary_id).first()
+        if summary_item:
+            summary_item.impact_score = score
+            self.session.commit()
+            return True
+        return False
+    def save_daily_digest(self, title: str, content: str, digest_date: Optional[date] = None) -> bool:
+        """
+        Saves the Daily Digest. 
+        Requires a TITLE and CONTENT.
+        """
+        if digest_date is None:
+            digest_date = date.today()
+
+        exists = self.session.query(DailyDigest).filter_by(date=digest_date).first()
+        
+        if not exists:
+            new_digest = DailyDigest(
+                date=digest_date,
+                title=title,    # <--- NOW ADDED
+                content=content
+            )
+            self.session.add(new_digest)
+            self.session.commit()
+            return True
+        return False
