@@ -1,10 +1,20 @@
+from datetime import date
+from typing import Optional, Union
 from sqlalchemy.orm import Session
-from app.database.models import OpenAIArticle, AnthropicArticle, YouTubeVideo
+# Make sure to import the new models here
+from app.database.models import (
+    OpenAIArticle, 
+    AnthropicArticle, 
+    YouTubeVideo, 
+    ArticleSummary, 
+    DailyDigest
+)
 
 class Repository:
     def __init__(self, session: Session):
         self.session = session
 
+    # --- 1. OpenAI ---
     def save_openai(self, article, content: str) -> bool:
         """
         Saves an OpenAI article if it doesn't already exist.
@@ -23,6 +33,7 @@ class Repository:
             return True
         return False
 
+    # --- 2. Anthropic ---
     def save_anthropic(self, source_type: str, article, content: str) -> bool:
         """
         Saves an Anthropic article (GitHub or Research) if it doesn't exist.
@@ -42,6 +53,7 @@ class Repository:
             return True
         return False
 
+    # --- 3. YouTube ---
     def save_youtube(self, video) -> bool:
         """
         Saves YouTube metadata (Transcript is deliberately skipped/None).
@@ -69,6 +81,49 @@ class Repository:
         video = self.session.query(YouTubeVideo).filter_by(video_id=video_id).first()
         if video:
             video.transcript = transcript_text
+            self.session.commit()
+            return True
+        return False
+
+    # --- 4. Article Summaries (New) ---
+    def save_summary(self, source_id: int, source_type: str, title: str, source_url: str, summary_text: str, impact_score: int) -> bool:
+        exists = self.session.query(ArticleSummary).filter_by(
+            source_id=source_id, 
+            source_type=source_type
+        ).first()
+
+        if not exists:
+            new_summary = ArticleSummary(
+                source_id=source_id,
+                source_type=source_type,
+                title=title,           # <--- Saving Title
+                source_url=source_url, # <--- Saving URL
+                summary=summary_text,
+                impact_score=impact_score
+            )
+            self.session.add(new_summary)
+            self.session.commit()
+            return True
+        return False
+
+    # --- 5. Daily Digest (New) ---
+    def save_daily_digest(self, content: str, digest_date: Optional[date] = None) -> bool:
+        """
+        Saves the Daily Digest. 
+        If digest_date is not provided, defaults to today's date.
+        Returns True if saved, False if a digest for that date already exists.
+        """
+        if digest_date is None:
+            digest_date = date.today()
+
+        exists = self.session.query(DailyDigest).filter_by(date=digest_date).first()
+        
+        if not exists:
+            new_digest = DailyDigest(
+                date=digest_date,
+                content=content
+            )
+            self.session.add(new_digest)
             self.session.commit()
             return True
         return False

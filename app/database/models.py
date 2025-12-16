@@ -1,7 +1,10 @@
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
-from sqlalchemy import String, Text, DateTime, func
+from sqlalchemy import String, Text, DateTime, Date, Integer, func, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from datetime import datetime, date
+from sqlalchemy import Integer, String, Text, DateTime, Date, func, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, DeclarativeBase
 
 class Base(DeclarativeBase):
     pass
@@ -41,4 +44,42 @@ class YouTubeVideo(Base):
     
     # Transcript is optional (to be filled later)
     transcript: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+# --- 4. Article Summaries (New) ---
+class ArticleSummary(Base):
+    __tablename__ = "article_summaries"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    
+    # Context Linking
+    source_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    
+    # --- NEW FIELDS ---
+    title: Mapped[str] = mapped_column(String(255), nullable=False)  # Stores the article title snapshot
+    source_url: Mapped[str] = mapped_column(String(500), nullable=False) # Stores the direct link
+    # ------------------
+
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    impact_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('source_id', 'source_type', name='uix_source_summary'),
+    )
+
+# --- 5. Daily Digest (Updated) ---
+class DailyDigest(Base):
+    __tablename__ = "daily_digests"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    date: Mapped[date] = mapped_column(Date, unique=True, index=True, default=func.current_date())
+    
+    # --- NEW FIELD ---
+    title: Mapped[str] = mapped_column(String(255), nullable=False) # e.g., "AI Breakthroughs: GPT-5 Rumors & More"
+    # -----------------
+
+    content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())

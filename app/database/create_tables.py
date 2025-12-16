@@ -5,7 +5,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from app.database.connection import engine
-from app.database.models import Base, OpenAIArticle, AnthropicArticle, YouTubeVideo
+from app.database.models import Base, OpenAIArticle, AnthropicArticle, YouTubeVideo, ArticleSummary, DailyDigest
 
 def init_db():
     print("🔄 Connecting to database...")
