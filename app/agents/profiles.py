@@ -86,6 +86,6 @@ Medium Value (50-79):
 Low Value / Noise (0-49):
 - Product launches or SaaS tools.
 - "How to use ChatGPT" tutorials.
-- Surface-level industry news.
+- Surface-level industry news
 """
 }
