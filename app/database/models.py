@@ -83,3 +83,39 @@ class DailyDigest(Base):
 
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+
+from datetime import datetime
+from typing import Optional
+from sqlalchemy import String, Text, DateTime, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+class Base(DeclarativeBase):
+    pass
+
+# --- Unified News Table ---
+# This model captures all the fields required by your new Pydantic schema
+class ScrapedArticle(Base):
+    """
+    Main table for storing full article content for later processing.
+    """
+    __tablename__ = "scraped_articles"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    
+    # Core Metadata
+    article_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_link: Mapped[str] = mapped_column(String(500), unique=True, index=True, nullable=False)
+    source_type: Mapped[str] = mapped_column(String(50), index=True) # e.g., 'openai', 'anthropic_research'
+    
+    # Dates
+    published_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    
+    # High-Fidelity Content
+    full_content: Mapped[str] = mapped_column(Text, nullable=False) 
+
+    def __repr__(self):
+        return f"<Article(name={self.article_name}, source={self.source_type})>"
+
+
