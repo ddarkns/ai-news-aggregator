@@ -37,13 +37,15 @@ class ScraperOutput(BaseModel):
 
 # --- 2. State Definition ---
 
-def overwrite_list(old: Optional[list], new: Optional[list]):
+def overwrite(old: Optional[any], new: Optional[any]):
     return new
 
 class ScraperState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    articles: Annotated[List[ArticleData], overwrite_list]
-    final_output: Annotated[Optional[ScraperOutput], overwrite_list]
+    articles: Annotated[List[ArticleData], overwrite]
+    final_output: Annotated[Optional[ScraperOutput], overwrite]
+    # Parameter to control items per feed
+    top_n: Annotated[int, overwrite]
 
 # --- 3. LLM Setup ---
 
@@ -61,25 +63,34 @@ agent_prompt = ChatPromptTemplate.from_messages([
 # --- 4. Node Functions ---
 
 def fetch_rss_node(state: ScraperState):
+    """Iterates through all provided URLs and fetches top_n articles from each."""
     user_message = state["messages"][-1].content
     url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[/\w\.-]*(?:\?\S*)?'
     urls = re.findall(url_pattern, user_message)
+    
+    # Default top_n to 2 if not explicitly set in state
+    n = state.get("top_n", 2)
     
     if not urls:
         urls = ["https://techcrunch.com/feed/"]
     
     found_articles = []
     for url in urls:
+        print(f"Fetching RSS feed: {url}")
         feed = feedparser.parse(url)
-        if feed.bozo: continue
+        if feed.bozo: 
+            print(f"Error parsing feed {url}")
+            continue
             
-        for entry in feed.entries[:2]:
+        # Take the top N entries from each URL
+        for entry in feed.entries[:n]:
             found_articles.append(ArticleData(
                 title=entry.get('title', 'No Title'),
                 link=entry.get('link', url),
-                summary=entry.get('summary', '')[:200]
+                summary=entry.get('summary', '')[:300]
             ))
     
+    print(f"Total articles found: {len(found_articles)}")
     return {"articles": found_articles}
 
 async def scrape_content_node(state: ScraperState):
@@ -87,8 +98,6 @@ async def scrape_content_node(state: ScraperState):
     updated_articles = []
     
     async with async_playwright() as p:
-        # Launch ONE browser instance
-        # ignore_default_args helps bypass some basic automation detection
         browser = await p.chromium.launch(
             headless=False, 
             args=["--disable-blink-features=AutomationControlled"]
@@ -96,20 +105,20 @@ async def scrape_content_node(state: ScraperState):
         
         for article in state["articles"]:
             try:
-                print(f"Scraping: {article.title}")
+                print(f"Scraping Content: {article.title}")
                 
                 # Create a fresh, isolated context for every page
-                # This prevents session/cache conflicts that cause React/Next.js crashes
                 context = await browser.new_context(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
                 )
                 
                 page = await context.new_page()
-                
-                # Navigate and wait for the network to be quiet to ensure hydration is done
+                # Wait until network is quiet to ensure client-side JS (Next.js/React) is hydrated
                 await page.goto(article.link, wait_until="networkidle", timeout=60000)
                 
-                # Extract clean text
+                # Wait an extra bit for any delayed client-side rendering
+                await asyncio.sleep(2)
+                
                 content = await page.inner_text('body')
                 
                 if content and len(content) > 300:
@@ -117,7 +126,6 @@ async def scrape_content_node(state: ScraperState):
                 else:
                     article.full_content = article.summary
                 
-                # Close context to wipe temporary data
                 await context.close()
                 
             except Exception as e:
@@ -143,8 +151,8 @@ def format_report_node(state: ScraperState):
         )
     
     request_text = (
-        f"Create a 'deep_dive_report.txt'. \n"
-        f"For each article, provide a deep summary and then list the source URL.\n\n"
+        f"Create a 'multi_source_report.txt'. \n"
+        f"Summarize the following articles deeply. Ensure each summary is followed by its source URL.\n\n"
         f"DATA:\n{context}"
     )
     
@@ -175,16 +183,28 @@ workflow = builder.compile()
 # --- 6. Execution ---
 
 async def main():
-    user_prompt = "Summarize the latest from https://openai.com/news/rss.xml and https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml"
-    print("--- Starting Scraper Workflow ---")
+    # You can now list as many URLs as you want here
+    user_prompt = """
+    Summarize the latest updates from:
+    1. OpenAI: https://openai.com/news/rss.xml
+    2. Anthropic: https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml
+    3. NASA: https://www.nasa.gov/news-release/feed/
+    """
     
-    inputs = {"messages": [HumanMessage(content=user_prompt)]}
+    print("--- Starting Multi-Source Scraper Workflow ---")
+    
+    # Set top_n here to control how many articles per feed
+    inputs = {
+        "messages": [HumanMessage(content=user_prompt)],
+        "top_n": 1 # Pull 1 article from each of the 3 feeds
+    }
+    
     final_state = await workflow.ainvoke(inputs)
     
     if final_state.get("final_output"):
         for file in final_state["final_output"].files:
             print(f"\nFILENAME: {file.file_name}")
-            print("=" * 30)
+            print("=" * 40)
             print(file.content)
 
 if __name__ == "__main__":
