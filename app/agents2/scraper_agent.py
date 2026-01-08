@@ -1,0 +1,209 @@
+import os
+import sys
+import asyncio
+import re
+import feedparser
+import nest_asyncio
+import requests
+from datetime import datetime
+from typing import Annotated, List, Optional, TypedDict
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+from langchain_groq import ChatGroq
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import PydanticOutputParser
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+
+# Playwright Imports
+from playwright.async_api import async_playwright
+
+# Database Imports (Assuming your project structure)
+from app.database.connection import SessionLocal
+from app.database.repository import Repository
+from app.database.create_tables import init_db
+
+nest_asyncio.apply()
+load_dotenv()
+
+# --- 1. Pydantic Models ---
+
+class ArticleRecord(BaseModel):
+    article_name: str = Field(description="The full title of the article")
+    source_link: str = Field(description="The original URL of the article")
+    published_date: str = Field(description="The date the article was published")
+    full_content: str = Field(description="The entire text content of the article")
+    source_type: Optional[str] = Field(default="general", description="Source category (e.g., openai, anthropic)")
+
+class ArticleBatch(BaseModel):
+    articles: List[ArticleRecord] = Field(description="List of fully scraped article records")
+
+class DiscoveryOutput(BaseModel):
+    urls: List[str] = Field(description="List of resolved RSS feed URLs")
+
+# --- 2. State Definition ---
+
+def overwrite(old: Optional[any], new: Optional[any]):
+    return new
+
+class AgentState(TypedDict):
+    """The state object passed between nodes in the graph."""
+    messages: Annotated[list[BaseMessage], add_messages]
+    user_query: Annotated[str, overwrite]        # The prompt from profile.py
+    discovered_urls: Annotated[List[str], overwrite]
+    raw_articles: Annotated[List[dict], overwrite]
+    final_records: Annotated[Optional[ArticleBatch], overwrite]
+    top_n: Annotated[int, overwrite]
+
+# --- 3. LLM Setup ---
+
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+discovery_parser = PydanticOutputParser(pydantic_object=DiscoveryOutput)
+
+# --- 4. Node Functions ---
+
+async def discovery_node(state: AgentState):
+    """Identifies RSS URLs from prompt or predefined directory."""
+    query = state.get("user_query", "").lower()
+    
+    # Predefined recommendations
+    RSS_DIRECTORY = {
+        "openai": "https://openai.com/news/rss.xml",
+        "anthropic news": "https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml",
+        "anthropic research": "https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_research.xml"
+    }
+    
+    # 1. Check for manual URLs in query
+    found_urls = re.findall(r'https?://\S+', query)
+    
+    # 2. Match keywords against directory
+    for name, url in RSS_DIRECTORY.items():
+        if name in query and url not in found_urls:
+            found_urls.append(url)
+            
+    # 3. AI Discovery for unknown sources
+    if not found_urls:
+        prompt = f"Find the most likely RSS feed URL for: {query}\n{discovery_parser.get_format_instructions()}"
+        response = await llm.ainvoke(prompt)
+        found_urls = discovery_parser.parse(response.content).urls
+
+    return {"discovered_urls": list(set(found_urls))}
+
+async def fetch_rss_node(state: AgentState):
+    """Fetches metadata (Title, Link, Date) from discovered RSS feeds."""
+    n = state.get("top_n", 1)
+    raw_list = []
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    for url in state["discovered_urls"]:
+        try:
+            print(f"📡 Fetching RSS: {url}")
+            resp = requests.get(url, headers=headers, timeout=10)
+            feed = feedparser.parse(resp.text)
+            for entry in feed.entries[:n]:
+                pub_date = entry.get('published', entry.get('updated', datetime.now().strftime("%Y-%m-%d")))
+                raw_list.append({
+                    "title": entry.get('title', 'No Title'),
+                    "link": entry.get('link'),
+                    "date": pub_date
+                })
+        except Exception as e:
+            print(f"❌ RSS Error ({url}): {e}")
+    
+    return {"raw_articles": raw_list}
+
+async def scrape_content_node(state: AgentState):
+    """Performs deep scraping using Playwright with optimized wait states."""
+    final_articles = []
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        for raw in state["raw_articles"]:
+            try:
+                print(f"🔍 Deep Scraping: {raw['title']}")
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+                )
+                page = await context.new_page()
+                
+                # Speed Optimization: Block heavy media
+                await page.route("**/*", lambda route: route.abort() 
+                    if route.request.resource_type in ["image", "media", "font"] 
+                    else route.continue_()
+                )
+
+                await page.goto(raw['link'], wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3) # Wait for JS hydration
+                
+                full_text = await page.inner_text('body')
+                
+                final_articles.append(ArticleRecord(
+                    article_name=raw['title'],
+                    source_link=raw['link'],
+                    published_date=raw['date'],
+                    full_content=full_text if full_text else "Content extraction failed."
+                ))
+                await context.close()
+            except Exception as e:
+                print(f"⚠️ Scrape Error on {raw['link']}: {e}")
+                
+        await browser.close()
+    return {"final_records": ArticleBatch(articles=final_articles)}
+
+def persistence_node(state: AgentState):
+    """Saves the final records to the PostgreSQL database."""
+    session = SessionLocal()
+    repo = Repository(session)
+    saved_count = 0
+    
+    if state["final_records"]:
+        for record in state["final_records"].articles:
+            # Source Routing
+            url = record.source_link.lower()
+            if "openai.com" in url:
+                record.source_type = "openai"
+            elif "anthropic.com" in url:
+                record.source_type = "anthropic_research" if "research" in url else "anthropic_news"
+            else:
+                record.source_type = "general"
+
+            if repo.save_general_article(record):
+                saved_count += 1
+                print(f"✅ DB Saved: {record.article_name[:40]}...")
+    
+    session.close()
+    return {"messages": [AIMessage(content=f"Database updated. Total new articles: {saved_count}")]}
+
+# --- 5. Graph Construction ---
+
+builder = StateGraph(AgentState)
+
+builder.add_node("discovery", discovery_node)
+builder.add_node("fetcher", fetch_rss_node)
+builder.add_node("scraper", scrape_content_node)
+builder.add_node("persistence", persistence_node)
+
+builder.add_edge(START, "discovery")
+builder.add_edge("discovery", "fetcher")
+builder.add_edge("fetcher", "scraper")
+builder.add_edge("scraper", "persistence")
+builder.add_edge("persistence", END)
+
+scrapper_agent = builder.compile()
+
+# --- 6. Direct Execution Test ---
+
+if __name__ == "__main__":
+    async def run_test():
+        init_db()
+        test_input = {
+            "user_query": "Get latest news from OpenAI and Anthropic news",
+            "top_n": 1
+        }
+        print("🚀 Starting Scrapper Agent Graph...")
+        result = await scrapper_agent.ainvoke(test_input)
+        print(f"\nGraph Execution Status: {result['messages'][-1].content}")
+
+    asyncio.run(run_test())

@@ -1,19 +1,56 @@
 from datetime import date, datetime
 from typing import Optional, Union, List
 from sqlalchemy.orm import Session
-# Added ScrapedArticle to the imports
+# Added ScrapedArticle and AggregatedSummary to the imports
 from app.database.models import (
     OpenAIArticle, 
     AnthropicArticle, 
     YouTubeVideo, 
     ArticleSummary, 
     DailyDigest,
-    ScrapedArticle  # Assuming you added the model we discussed
+    ScrapedArticle,
+    AggregatedSummary
 )
 
 class Repository:
     def __init__(self, session: Session):
         self.session = session
+
+    # --- AGENT-READY METHODS (Agents2) ---
+
+    def get_unprocessed_scraped_articles(self, limit: int = 10) -> List[ScrapedArticle]:
+        """
+        Finds articles in scraped_articles that DON'T have a summary yet.
+        This is the primary input for your Summary Agent.
+        """
+        return self.session.query(ScrapedArticle).filter(
+            ~ScrapedArticle.source_link.in_(
+                self.session.query(AggregatedSummary.source_link)
+            )
+        ).limit(limit).all()
+
+    def save_aggregated_summary(self, summary_data) -> bool:
+        """
+        Saves processed summary data from the Summary/Score agents.
+        Returns True if saved, False if duplicate.
+        """
+        exists = self.session.query(AggregatedSummary).filter_by(
+            source_link=str(summary_data.source_link)
+        ).first()
+
+        if not exists:
+            new_summary = AggregatedSummary(
+                article_name=summary_data.article_name,
+                source_link=summary_data.source_link,
+                published_date=summary_data.published_date,
+                summary=summary_data.summary,
+                impact_score=getattr(summary_data, 'impact_score', 0),
+                relevance_explanation=getattr(summary_data, 'explanation', None)
+            )
+            self.session.add(new_summary)
+            self.session.commit()
+            return True
+        return False
 
     # --- NEW: General Scraper Integration ---
     def save_general_article(self, article_data) -> bool:
