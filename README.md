@@ -1,191 +1,85 @@
 import os
+import sys
 import asyncio
-import re
-import feedparser
-import nest_asyncio
-from typing import Annotated, List, Optional, TypedDict
-from pydantic import BaseModel, Field
+from typing import TypedDict
 from dotenv import load_dotenv
 
-from langchain_groq import ChatGroq
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
+# --- ROBUST PATH FIX ---
+# This ensures that no matter where you run the script from, 
+# it finds the 'app' directory as the root.
+current_dir = os.path.dirname(os.path.abspath(__file__)) # app/agents2
+parent_dir = os.path.dirname(current_dir)                # app/
+sys.path.append(parent_dir)
+
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
 
-# Playwright Imports
-from playwright.async_api import async_playwright
+# Import agents using the parent directory context
+try:
+    from agents2.scraper_agent import scrapper_agent
+    from agents2.cleaner_agent import cleaner_agent
+    from agents2.score_agent import score_agent
+    from agents2.summary_agent import summary_agent
+    from agents2.email_agent import EmailAgent
+except ImportError as e:
+    print(f"❌ Import Error: {e}")
+    # Fallback for direct imports if pathing is strict
+    from scrapper_agent import scrapper_agent
+    from cleaner_agent import cleaner_agent
+    from score_agent import score_agent
+    from summary_agent import summary_agent
+    from email_agent import EmailAgent
 
-nest_asyncio.apply()
 load_dotenv()
 
-# --- 1. Pydantic Models ---
+class OrchestratorState(TypedDict):
+    user_query: str
+    top_n: int
+    pipeline_status: str
 
-class ArticleData(BaseModel):
-    title: str
-    link: str
-    summary: str
-    full_content: Optional[str] = None
+# Nodes remain the same as your provided code
+async def run_scrapper_node(state: OrchestratorState):
+    print("\n--- 🛰️ STEP 1: SCRAPING ---")
+    await scrapper_agent.ainvoke({"user_query": state["user_query"], "top_n": state["top_n"]})
+    return {"pipeline_status": "scraped"}
 
-class FileContent(BaseModel):
-    file_name: str = Field(description="Name of the file with extension")
-    content: str = Field(description="The formatted text content. MUST include the source URL for each article.")
+async def run_cleaner_node(state: OrchestratorState):
+    print("\n--- 🧹 STEP 2: CLEANING & EXTRACTION ---")
+    await cleaner_agent.ainvoke({"raw_articles": []})
+    return {"pipeline_status": "cleaned"}
 
-class ScraperOutput(BaseModel):
-    files: List[FileContent] = Field(description="List of files to create")
+async def run_scorer_node(state: OrchestratorState):
+    print("\n--- 🎯 STEP 3: PERSONALIZED SCORING ---")
+    await score_agent.ainvoke({"articles_to_score": []})
+    return {"pipeline_status": "scored"}
 
-# --- 2. State Definition ---
+async def run_summarizer_node(state: OrchestratorState):
+    print("\n--- ✍️ STEP 4: NARRATIVE SYNTHESIS ---")
+    await summary_agent.ainvoke({"pending_summaries": []})
+    return {"pipeline_status": "summarized"}
 
-def overwrite_list(old: Optional[list], new: Optional[list]):
-    return new
+async def run_email_node(state: OrchestratorState):
+    print("\n--- 📧 STEP 5: NEWSLETTER DELIVERY ---")
+    EmailAgent().run()
+    return {"pipeline_status": "completed"}
 
-class ScraperState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
-    articles: Annotated[List[ArticleData], overwrite_list]
-    final_output: Annotated[Optional[ScraperOutput], overwrite_list]
+builder = StateGraph(OrchestratorState)
+builder.add_node("scrapper", run_scrapper_node)
+builder.add_node("cleaner", run_cleaner_node)
+builder.add_node("scorer", run_scorer_node)
+builder.add_node("summarizer", run_summarizer_node)
+builder.add_node("emailer", run_email_node)
 
-# --- 3. LLM Setup ---
+builder.add_edge(START, "scrapper")
+builder.add_edge("scrapper", "cleaner")
+builder.add_edge("cleaner", "scorer")
+builder.add_edge("scorer", "summarizer")
+builder.add_edge("summarizer", "emailer")
+builder.add_edge("emailer", END)
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-file_parser = PydanticOutputParser(pydantic_object=ScraperOutput)
-
-agent_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are an expert News Editor. Create a comprehensive report.\n"
-               "CRITICAL: For every article you summarize, you MUST append the source URL provided in the context.\n"
-               "Use proper formatting, headings, and '\\n' for new lines.\n"
-               "{format_instructions}"),
-    ("human", "{request}")
-])
-
-# --- 4. Node Functions ---
-
-def fetch_rss_node(state: ScraperState):
-    user_message = state["messages"][-1].content
-    url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[/\w\.-]*(?:\?\S*)?'
-    urls = re.findall(url_pattern, user_message)
-    
-    if not urls:
-        urls = ["https://techcrunch.com/feed/"]
-    
-    found_articles = []
-    for url in urls:
-        feed = feedparser.parse(url)
-        if feed.bozo: continue
-            
-        for entry in feed.entries[:2]:
-            found_articles.append(ArticleData(
-                title=entry.get('title', 'No Title'),
-                link=entry.get('link', url),
-                summary=entry.get('summary', '')[:200]
-            ))
-    
-    return {"articles": found_articles}
-
-async def scrape_content_node(state: ScraperState):
-    """Scrapes content using isolated contexts to avoid client-side exceptions."""
-    updated_articles = []
-    
-    async with async_playwright() as p:
-        # Launch ONE browser instance
-        # ignore_default_args helps bypass some basic automation detection
-        browser = await p.chromium.launch(
-            headless=False, 
-            args=["--disable-blink-features=AutomationControlled"]
-        )
-        
-        for article in state["articles"]:
-            try:
-                print(f"Scraping: {article.title}")
-                
-                # Create a fresh, isolated context for every page
-                # This prevents session/cache conflicts that cause React/Next.js crashes
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-                )
-                
-                page = await context.new_page()
-                
-                # Navigate and wait for the network to be quiet to ensure hydration is done
-                await page.goto(article.link, wait_until="networkidle", timeout=60000)
-                
-                # Extract clean text
-                content = await page.inner_text('body')
-                
-                if content and len(content) > 300:
-                    article.full_content = content[:5000]
-                else:
-                    article.full_content = article.summary
-                
-                # Close context to wipe temporary data
-                await context.close()
-                
-            except Exception as e:
-                print(f"Error scraping {article.link}: {e}")
-                article.full_content = article.summary
-                
-            updated_articles.append(article)
-        
-        await browser.close()
-        
-    return {"articles": updated_articles}
-
-def format_report_node(state: ScraperState):
-    llm_json = llm.bind(response_format={"type": "json_object"})
-    
-    context = ""
-    for i, a in enumerate(state["articles"]):
-        context += (
-            f"--- ARTICLE ENTRY {i} ---\n"
-            f"TITLE: {a.title}\n"
-            f"SOURCE URL: {a.link}\n"
-            f"CONTENT: {a.full_content}\n\n"
-        )
-    
-    request_text = (
-        f"Create a 'deep_dive_report.txt'. \n"
-        f"For each article, provide a deep summary and then list the source URL.\n\n"
-        f"DATA:\n{context}"
-    )
-    
-    prompt = agent_prompt.format_prompt(
-        request=request_text,
-        format_instructions=file_parser.get_format_instructions()
-    )
-    
-    response = llm_json.invoke(prompt.to_messages())
-    parsed_output = file_parser.parse(response.content)
-    
-    return {"final_output": parsed_output}
-
-# --- 5. Graph Construction ---
-
-builder = StateGraph(ScraperState)
-builder.add_node("fetcher", fetch_rss_node)
-builder.add_node("scraper", scrape_content_node)
-builder.add_node("formatter", format_report_node)
-
-builder.add_edge(START, "fetcher")
-builder.add_edge("fetcher", "scraper")
-builder.add_edge("scraper", "formatter")
-builder.add_edge("formatter", END)
-
-workflow = builder.compile()
-
-# --- 6. Execution ---
-
-async def main():
-    user_prompt = "Summarize the latest from https://openai.com/news/rss.xml and https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml"
-    print("--- Starting Scraper Workflow ---")
-    
-    inputs = {"messages": [HumanMessage(content=user_prompt)]}
-    final_state = await workflow.ainvoke(inputs)
-    
-    if final_state.get("final_output"):
-        for file in final_state["final_output"].files:
-            print(f"\nFILENAME: {file.file_name}")
-            print("=" * 30)
-            print(file.content)
+orchestrator = builder.compile()
 
 if __name__ == "__main__":
+    async def main():
+        inputs = {"user_query": "", "top_n": 1}
+        await orchestrator.ainvoke(inputs)
     asyncio.run(main())

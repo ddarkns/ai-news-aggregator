@@ -76,13 +76,14 @@ class ProfileGenerator:
 # In a real UI, this would be loaded from a database or JSON file
 MY_PROFILE = UserProfile(
     name="Krish",
-    bio="AI Engineer focused on Agentic workflows and LangGraph.",
-    interests=["LangGraph", "PostgreSQL"],
-    must_include=["Agents", "Persistence"],
-    ignore_topics=["Marketing"],
-    preferred_depth="Technical",
+    bio="Macroeconomic and Political Analyst focusing on global market trends, fiscal policy, and geopolitical stability.",
+    interests=["Global Markets", "Fiscal Policy", "Geopolitics", "Central Bank Decisions", "Trade Agreements"],
+    must_include=["Inflation", "Interest Rates", "Elections", "GDP", "Sanctions", "Regulatory Changes"],
+    ignore_topics=["Sports", "Celebrity News", "Entertainment", "Consumer Tech Reviews"],
+    preferred_depth="Analytical",
     custom_sources={
-        "openai": "https://openai.com/news/rss.xml",
-        "anthropic": "https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml"
+        "reuters_business": "https://www.reutersagency.com/feed/?best-topics=business&post_type=best",
+        "ft_global_economy": "https://www.ft.com/global-economy?format=rss",
+        "economist_politics": "https://www.economist.com/international/rss.xml"
     }
 )

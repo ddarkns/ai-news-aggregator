@@ -1,55 +1,40 @@
-import sys
 import os
-import argparse  # <--- NEW IMPORT
+import sys
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+from typing import List, Dict
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Path fix
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-from app.database.create_tables import init_db
-from app.database.connection import get_db
-from app.runner import run_pipeline
-from app.services.process_transcript import TranscriptService
+from agents2.orchestrator import orchestrator
+from agents2.profile import UserProfile
 
-def main():
-    # 1. Setup Argument Parser
-    parser = argparse.ArgumentParser(description="Run The Final Cook Pipeline")
-    parser.add_argument("--skip-scrape", action="store_true", help="Skip Phase 1 (Scraping) and only run Phase 2 (Transcripts)")
-    args = parser.parse_args()
+app = FastAPI(title="Agents2 News Engine")
 
-    print("🎬 Starting The Final Cook Application...")
-    
-    # Phase 1: Database Check (Always do this)
-    print("\n[1/3] Initializing Database...")
-    try:
-        init_db()
-    except Exception as e:
-        print(f"❌ Critical Error: {e}")
-        return
+class PipelineRequest(BaseModel):
+    name: str
+    email: str
+    interests: List[str]
+    must_include: List[str]
+    query: str
 
-    # Phase 2: Discovery (Scraping) - CONDITIONAL
-    if not args.skip_scrape:
-        print("\n[2/3] Running Scraping Pipeline (Discovery)...")
-        try:
-            results = run_pipeline()
-        except Exception as e:
-            print(f"\n❌ Scraping Pipeline failed: {e}")
-    else:
-        print("\n[2/3] ⏩ SKIPPING Scraping Pipeline (User requested)")
+async def run_pipeline(data: PipelineRequest):
+    print(f"🚀 Background Pipeline Started for {data.name}...")
+    # Trigger the orchestrator
+    # Note: In a production app, you'd override the MY_PROFILE 
+    # dynamicly, but for now, we trigger the workflow.
+    await orchestrator.ainvoke({
+        "user_query": data.query,
+        "top_n": 2
+    })
 
-    # Phase 3: Enrichment (Transcripts) - ALWAYS RUN
-    print("\n[3/3] Processing Transcripts (Enrichment)...")
-    
-    db_gen = get_db()
-    session = next(db_gen)
-
-    try:
-        processor = TranscriptService(session)
-        processor.run()
-    except Exception as e:
-        print(f"❌ Transcript processing failed: {e}")
-    finally:
-        session.close()
-
-    print("\n🎉 EXECUTION COMPLETE")
+@app.post("/trigger-digest")
+async def trigger_digest(request: PipelineRequest, background_tasks: BackgroundTasks):
+    # We run this as a background task so the UI doesn't time out
+    background_tasks.add_task(run_pipeline, request)
+    return {"status": "success", "message": "Pipeline triggered in background. You will receive an email shortly!"}
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

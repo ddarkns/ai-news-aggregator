@@ -9,17 +9,18 @@ from datetime import datetime
 from typing import Annotated, List, Optional, TypedDict
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-
-# Path fix
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
-
 from langchain_groq import ChatGroq
-from langchain_core.messages import BaseMessage, AIMessage
-from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import PydanticOutputParser
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+
+# Playwright Imports
 from playwright.async_api import async_playwright
 
+# Database Imports (Assuming your project structure)
 from app.database.connection import SessionLocal
 from app.database.repository import Repository
 from app.database.create_tables import init_db
@@ -27,112 +28,83 @@ from app.database.create_tables import init_db
 nest_asyncio.apply()
 load_dotenv()
 
-# --- 1. Models ---
+# --- 1. Pydantic Models ---
+
 class ArticleRecord(BaseModel):
-    article_name: str
-    source_link: str
-    published_date: str
-    full_content: str
-    source_type: Optional[str] = "general"
+    article_name: str = Field(description="The full title of the article")
+    source_link: str = Field(description="The original URL of the article")
+    published_date: str = Field(description="The date the article was published")
+    full_content: str = Field(description="The entire text content of the article")
+    source_type: Optional[str] = Field(default="general", description="Source category (e.g., openai, anthropic)")
 
 class ArticleBatch(BaseModel):
-    articles: List[ArticleRecord]
+    articles: List[ArticleRecord] = Field(description="List of fully scraped article records")
 
 class DiscoveryOutput(BaseModel):
-    urls: List[str]
+    urls: List[str] = Field(description="List of resolved RSS feed URLs")
 
-# --- 2. State ---
-def overwrite(old, new): return new
+# --- 2. State Definition ---
+
+def overwrite(old: Optional[any], new: Optional[any]):
+    return new
 
 class AgentState(TypedDict):
+    """The state object passed between nodes in the graph."""
     messages: Annotated[list[BaseMessage], add_messages]
-    user_query: Annotated[str, overwrite]
+    user_query: Annotated[str, overwrite]        # The prompt from profile.py
     discovered_urls: Annotated[List[str], overwrite]
     raw_articles: Annotated[List[dict], overwrite]
     final_records: Annotated[Optional[ArticleBatch], overwrite]
     top_n: Annotated[int, overwrite]
 
-# --- 3. Nodes ---
+# --- 3. LLM Setup ---
+
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+discovery_parser = PydanticOutputParser(pydantic_object=DiscoveryOutput)
+
+# --- 4. Node Functions ---
 
 async def discovery_node(state: AgentState):
-    """
-    Router Node: Processes the query against a local directory AND 
-    uses AI to resolve multiple sources simultaneously.
-    """
+    """Identifies RSS URLs from prompt or predefined directory."""
     query = state.get("user_query", "").lower()
     
-    # 1. Primary Directory
+    # Predefined recommendations
     RSS_DIRECTORY = {
-    # Tech / AI
-    "openai": "https://openai.com/news/rss.xml",
-    "anthropic news": "https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml",
-    "anthropic research": "https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_research.xml",
-    "techcrunch": "https://techcrunch.com/feed/",
-    "the verge": "https://www.theverge.com/rss/index.xml",
+        "openai": "https://openai.com/news/rss.xml",
+        "anthropic news": "https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_news.xml",
+        "anthropic research": "https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_research.xml",
+        "The Times of India": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+        "The Hindu":"https://www.thehindu.com/news/national/feeder/default.rss",
+        "Hindustan Times":"https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml"
+    }
     
-    # Indian News (Regional & National)
-    "times of india": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
-    "the hindu": "https://www.thehindu.com/news/national/feeder/default.rss",
-    "hindustan times": "https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml",
-    "ndtv": "http://feeds.feedburner.com/ndtvnews-top-stories",
-    "moneycontrol": "https://www.moneycontrol.com/rss/latestnews.xml"
-}
+    # 1. Check for manual URLs in query
+    found_urls = re.findall(r'https?://\S+', query)
     
-    # 2. Strategy: Let the LLM be the "Intelligence Router"
-    # We pass the directory as context so the AI can pick the right keys.
-    parser = JsonOutputParser(pydantic_object=DiscoveryOutput)
-    
-    prompt = f"""
-    You are a professional News Router. 
-    Analyze the user request and provide the correct RSS feed URLs.
-    
-    USER REQUEST: "{query}"
-    
-    LOCAL DIRECTORY:
-    {RSS_DIRECTORY}
-    
-    INSTRUCTIONS:
-    1. Identify ALL news sources mentioned in the request.
-    2. If a source is in the LOCAL DIRECTORY, use that URL.
-    3. If a source is requested that is NOT in the directory, find the most likely official RSS URL using your internal knowledge.
-    4. Provide a list of URLs for all requested sources.
-    
-    {parser.get_format_instructions()}
-    IMPORTANT: Return ONLY raw JSON.
-    """
-    
-    print("🧠 Routing query to identify all requested sources...")
-    response = await llm.ainvoke(prompt)
-    
-    found_urls = []
-    try:
-        # JsonOutputParser is robust against 'conversational' LLM output
-        parsed = parser.parse(response.content)
-        found_urls = parsed.get("urls", [])
-    except Exception:
-        # Fallback: Regex Safety Net
-        print("⚠️ AI Formatting error. Applying Regex fallback logic.")
-        found_urls = re.findall(r'https?://\S+', response.content)
-        
-    # Final check: Manual keyword override if AI missed a directory link
+    # 2. Match keywords against directory
     for name, url in RSS_DIRECTORY.items():
         if name in query and url not in found_urls:
             found_urls.append(url)
+            
+    # 3. AI Discovery for unknown sources
+    if not found_urls:
+        prompt = f"Find the most likely RSS feed URL for: {query}\n{discovery_parser.get_format_instructions()}"
+        response = await llm.ainvoke(prompt)
+        found_urls = discovery_parser.parse(response.content).urls
 
-    print(f"📡 Discovered {len(found_urls)} feed(s): {found_urls}")
     return {"discovered_urls": list(set(found_urls))}
 
 async def fetch_rss_node(state: AgentState):
-    """Fetches metadata from RSS."""
+    """Fetches metadata (Title, Link, Date) from discovered RSS feeds."""
     n = state.get("top_n", 1)
     raw_list = []
     headers = {'User-Agent': 'Mozilla/5.0'}
+
     for url in state["discovered_urls"]:
         try:
             print(f"📡 Fetching RSS: {url}")
             resp = requests.get(url, headers=headers, timeout=10)
             feed = feedparser.parse(resp.text)
-            # Limit entries per feed to keep the scraper focused
             for entry in feed.entries[:n]:
                 pub_date = entry.get('published', entry.get('updated', datetime.now().strftime("%Y-%m-%d")))
                 raw_list.append({
@@ -140,14 +112,15 @@ async def fetch_rss_node(state: AgentState):
                     "link": entry.get('link'),
                     "date": pub_date
                 })
-        except Exception as e: 
+        except Exception as e:
             print(f"❌ RSS Error ({url}): {e}")
-            
+    
     return {"raw_articles": raw_list}
 
 async def scrape_content_node(state: AgentState):
-    """Performs deep scraping using standard Playwright."""
+    """Performs deep scraping using Playwright with optimized wait states."""
     final_articles = []
+    
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
         for raw in state["raw_articles"]:
@@ -158,14 +131,14 @@ async def scrape_content_node(state: AgentState):
                 )
                 page = await context.new_page()
                 
-                # Block heavy media but keep scripts for hydration
+                # Speed Optimization: Block heavy media
                 await page.route("**/*", lambda route: route.abort() 
                     if route.request.resource_type in ["image", "media", "font"] 
                     else route.continue_()
                 )
 
                 await page.goto(raw['link'], wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(4) 
+                await asyncio.sleep(3) # Wait for JS hydration
                 
                 full_text = await page.inner_text('body')
                 
@@ -176,37 +149,40 @@ async def scrape_content_node(state: AgentState):
                     full_content=full_text if full_text else "Content extraction failed."
                 ))
                 await context.close()
-            except Exception as e: 
-                print(f"⚠️ Scrape Error: {e}")
+            except Exception as e:
+                print(f"⚠️ Scrape Error on {raw['link']}: {e}")
                 
         await browser.close()
     return {"final_records": ArticleBatch(articles=final_articles)}
 
 def persistence_node(state: AgentState):
-    """Saves to Postgres."""
+    """Saves the final records to the PostgreSQL database."""
     session = SessionLocal()
     repo = Repository(session)
     saved_count = 0
+    
     if state["final_records"]:
         for record in state["final_records"].articles:
+            # Source Routing
             url = record.source_link.lower()
-            if "openai.com" in url: record.source_type = "openai"
-            elif "anthropic.com" in url: record.source_type = "anthropic"
-            elif "timesofindia" in url: record.source_type = "times_of_india"
-            elif "thehindu" in url: record.source_type = "the_hindu"
-            else: record.source_type = "general"
+            if "openai.com" in url:
+                record.source_type = "openai"
+            elif "anthropic.com" in url:
+                record.source_type = "anthropic_research" if "research" in url else "anthropic_news"
+            else:
+                record.source_type = "general"
 
             if repo.save_general_article(record):
                 saved_count += 1
                 print(f"✅ DB Saved: {record.article_name[:40]}...")
-                
+    
     session.close()
-    return {"messages": [AIMessage(content=f"Workflow complete. Saved {saved_count} articles.")]}
+    return {"messages": [AIMessage(content=f"Database updated. Total new articles: {saved_count}")]}
 
-# --- 4. Graph Construction ---
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+# --- 5. Graph Construction ---
 
 builder = StateGraph(AgentState)
+
 builder.add_node("discovery", discovery_node)
 builder.add_node("fetcher", fetch_rss_node)
 builder.add_node("scraper", scrape_content_node)
@@ -220,16 +196,17 @@ builder.add_edge("persistence", END)
 
 scrapper_agent = builder.compile()
 
+# --- 6. Direct Execution Test ---
+
 if __name__ == "__main__":
     async def run_test():
         init_db()
-        # Test Case: Multiple Sources
         test_input = {
-            "user_query": "TOI, The Hindu, and tell me if there is anything new from the AI guys at Anthropic Research", 
+            "user_query": "Get latest news from times of india",
             "top_n": 1
         }
-        print("🚀 Starting Agent...")
+        print("🚀 Starting Scrapper Agent Graph...")
         result = await scrapper_agent.ainvoke(test_input)
-        print(f"\nFinal Status: {result['messages'][-1].content}")
-        
+        print(f"\nGraph Execution Status: {result['messages'][-1].content}")
+
     asyncio.run(run_test())
