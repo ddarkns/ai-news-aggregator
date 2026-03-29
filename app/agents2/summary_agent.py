@@ -9,8 +9,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
-# --- NEW IMPORT ---
-from langgraph.pregel.retry import RetryPolicy
 
 from app.database.connection import SessionLocal
 from app.database.models import AggregatedSummary, ScrapedArticle
@@ -54,8 +52,8 @@ async def fetch_high_score_facts(state: SummaryState):
 
 async def stage_1_context_node(state: SummaryState):
     """Stage 1: Summarize messy raw data with Rate Limit Protection."""
-    # ⏱️ PAUSE: Prevent burst limits
-    await asyncio.sleep(2)
+    # ⏱️ SLEEP: Replacing RetryPolicy with a simple sleep
+    await asyncio.sleep(5) 
 
     article = state["pending_summaries"][0]
     llm_struct = llm.with_structured_output(ContextSummary)
@@ -74,8 +72,8 @@ async def stage_1_context_node(state: SummaryState):
 
 async def stage_2_synthesis_node(state: SummaryState):
     """Stage 2: Final Synthesis with Rate Limit Protection."""
-    # ⏱️ PAUSE: Rate Limit protection
-    await asyncio.sleep(2)
+    # ⏱️ SLEEP: Replacing RetryPolicy with a simple sleep
+    await asyncio.sleep(5) 
 
     article = state["pending_summaries"][0]
     context = state["current_context_summary"]
@@ -109,21 +107,14 @@ async def stage_2_synthesis_node(state: SummaryState):
 
 # --- 4. Graph Construction ---
 
-# 🛡️ RETRY POLICY: Handle 429s automatically
-rate_limit_retry = RetryPolicy(
-    max_attempts=3,
-    wait_min=5.0,
-    backoff_factor=2.0
-)
-
 llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.1)
 
 builder = StateGraph(SummaryState)
 
 builder.add_node("fetch", fetch_high_score_facts)
-# Attach retry policy to LLM-heavy nodes
-builder.add_node("distill", stage_1_context_node, retry=rate_limit_retry)
-builder.add_node("synthesize", stage_2_synthesis_node, retry=rate_limit_retry)
+# Simple nodes without retry_policy argument
+builder.add_node("distill", stage_1_context_node)
+builder.add_node("synthesize", stage_2_synthesis_node)
 
 builder.add_edge(START, "fetch")
 builder.add_edge("distill", "synthesize")

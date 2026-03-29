@@ -10,8 +10,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
-# --- NEW IMPORT ---
-from langgraph.pregel.retry import RetryPolicy
 
 from app.database.connection import SessionLocal
 from app.database.models import AggregatedSummary
@@ -41,8 +39,8 @@ async def fetch_unscored_node(state: ScoreState):
 
 async def scoring_node(state: ScoreState):
     """Evaluate importance based on MY_PROFILE with Rate Limit Protection."""
-    # ⏱️ PAUSE: Prevent Groq burst limits
-    await asyncio.sleep(2)
+    # ⏱️ SLEEP: Replacing RetryPolicy with a simple sleep
+    await asyncio.sleep(5) 
 
     article = state["articles_to_score"][0]
     llm_struct = llm.with_structured_output(ScoreResult)
@@ -67,16 +65,21 @@ async def scoring_node(state: ScoreState):
     """
     
     print(f"⚖️ Personalized Scoring for {MY_PROFILE.name}: {article['title'][:40]}...")
-    result = await llm_struct.ainvoke(prompt)
     
-    # Update DB
-    session = SessionLocal()
-    db_article = session.query(AggregatedSummary).filter(AggregatedSummary.id == article['id']).first()
-    if db_article:
-        db_article.impact_score = result.impact_score
-        db_article.relevance_explanation = result.explanation
-        session.commit()
-    session.close()
+    try:
+        result = await llm_struct.ainvoke(prompt)
+        
+        # Update DB
+        session = SessionLocal()
+        db_article = session.query(AggregatedSummary).filter(AggregatedSummary.id == article['id']).first()
+        if db_article:
+            db_article.impact_score = result.impact_score
+            db_article.relevance_explanation = result.explanation
+            session.commit()
+        session.close()
+    except Exception as e:
+        print(f"⚠️ Scoring Error: {e}. Waiting 10s...")
+        await asyncio.sleep(10)
     
     return {
         "articles_to_score": state["articles_to_score"][1:], 
@@ -85,19 +88,12 @@ async def scoring_node(state: ScoreState):
 
 # --- 2. Graph Construction ---
 
-# 🛡️ RETRY POLICY: Handle 429s automatically
-rate_limit_retry = RetryPolicy(
-    max_attempts=3,
-    wait_min=5.0,
-    backoff_factor=2.0
-)
-
 llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 
 builder = StateGraph(ScoreState)
 builder.add_node("fetch", fetch_unscored_node)
-# Attach retry policy to the scoring node
-builder.add_node("score", scoring_node, retry=rate_limit_retry)
+# Simple node without retry_policy argument
+builder.add_node("score", scoring_node)
 
 builder.add_edge(START, "fetch")
 builder.add_conditional_edges("fetch", lambda s: "score" if s["articles_to_score"] else END)

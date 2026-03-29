@@ -1,161 +1,146 @@
 import os
 import sys
 import asyncio
-import time
-from typing import Annotated, List, TypedDict, Optional
+from typing import List, TypedDict
 from pydantic import BaseModel, Field
+from sqlalchemy import desc
 from dotenv import load_dotenv
 
 # Path fix
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from langchain_groq import ChatGroq
-from langchain_core.messages import BaseMessage
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import PydanticOutputParser
 from langgraph.graph import StateGraph, START, END
-# --- NEW IMPORT ---
-from langgraph.pregel.retry import RetryPolicy
 
 from app.database.connection import SessionLocal
+from app.database.models import ScrapedArticle, AggregatedSummary
 from app.database.repository import Repository
 
 load_dotenv()
 
-# --- 1. Models (Unchanged) ---
+# --- 1. Models ---
 class ExtractedFacts(BaseModel):
-    facts: List[str] = Field(description="A list of objective, verifiable news facts extracted from the text.")
-    is_junk: bool = Field(description="True if the content is an ad, login wall, or contains no news.")
+    facts: List[str] = Field(description="A list of objective news facts.")
+    is_junk: bool = Field(description="True if content is an ad or junk.")
 
 class ValidationResult(BaseModel):
-    is_hallucinated: bool = Field(description="True if the facts contain info not found in the raw text.")
-    cleaned_facts: List[str] = Field(description="The final verified list of facts.")
+    cleaned_facts: List[str] = Field(description="Verified list of facts.")
 
-# --- 2. State ---
-class CleanerState(TypedDict):
-    raw_articles: List[dict]
-    current_raw_text: str
-    extracted_facts: List[str]
-    is_junk: bool
-    processed_count: int
+w
+
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+fact_parser = PydanticOutputParser(pydantic_object=ExtractedFacts)
+val_parser = PydanticOutputParser(pydantic_object=ValidationResult)
 
 # --- 3. Nodes ---
 
-async def fetch_raw_node(state: CleanerState):
+async def fetch_recent_raw_node(state: CleanerState):
+    """
+    FIXED: Uses a Join to find articles that haven't been summarized yet.
+    Does NOT require the 'is_processed' column.
+    """
     session = SessionLocal()
-    repo = Repository(session)
-    articles = repo.get_unprocessed_scraped_articles(limit=5)
-    session.close()
     
-    raw_list = []
-    for a in articles:
-        raw_list.append({
-            "id": a.id,
-            "title": a.article_name,
-            "content": a.full_content,
-            "link": a.source_link,
-            "date": a.published_date
-        })
-    print(f"📦 Fetched {len(raw_list)} raw articles for cleaning.")
+    # Logic: Get ScrapedArticles that don't exist in AggregatedSummary based on link
+    articles = session.query(ScrapedArticle).outerjoin(
+        AggregatedSummary, ScrapedArticle.source_link == AggregatedSummary.source_link
+    ).filter(
+        AggregatedSummary.id == None  # This means no summary exists yet
+    ).order_by(desc(ScrapedArticle.created_at)).limit(10).all()
+    
+    raw_list = [{"id": a.id, "title": a.article_name, "content": a.full_content, 
+                 "link": a.source_link, "date": a.published_date} for a in articles]
+    
+    session.close()
+    print(f"📦 Fetched {len(raw_list)} NEW raw articles (via Left Join logic).")
     return {"raw_articles": raw_list, "processed_count": 0}
 
 async def extraction_node(state: CleanerState):
-    """Node 1: Extract core facts with Rate Limit Protection."""
-    # ⏱️ PAUSE: Give the API a breather before the request
     await asyncio.sleep(2) 
-    
     article = state["raw_articles"][0]
-    llm_struct = llm.with_structured_output(ExtractedFacts)
     
-    prompt = f"""
-    You are a Data Extraction Expert. Strip all HTML noise, ads, and footers.
-    Extract only the verifiable news facts from this content.
+    prompt = PromptTemplate(
+        template="Extract news facts from: {title}\n\nContent: {content}\n\n{format_instructions}",
+        input_variables=["title", "content"],
+        partial_variables={"format_instructions": fact_parser.get_format_instructions()}
+    )
     
-    TITLE: {article['title']}
-    CONTENT: {article['content'][:12000]}
-    """
+    chain = prompt | llm | fact_parser
+    print(f"🧹 Cleaning: {article['title'][:40]}...")
     
-    print(f"🧹 Extracting facts: {article['title'][:40]}...")
-    res = await llm_struct.ainvoke(prompt)
-    return {"extracted_facts": res.facts, "is_junk": res.is_junk, "current_raw_text": article['content'][:5000]}
+    try:
+        res = await chain.ainvoke({"title": article['title'], "content": article['content'][:8000]})
+        return {"extracted_facts": res.facts, "is_junk": res.is_junk, "current_raw_text": article['content'][:4000]}
+    except Exception as e:
+        print(f"❌ API Error: {e}")
+        return {"extracted_facts": [], "is_junk": True}
 
 async def validation_node(state: CleanerState):
-    """Node 2: Validate facts with Rate Limit Protection."""
-    if state["is_junk"]:
-        return {"extracted_facts": []}
-
-    # ⏱️ PAUSE: Rate Limit protection
+    if state["is_junk"] or not state["extracted_facts"]: return {"extracted_facts": []}
     await asyncio.sleep(2)
 
-    llm_struct = llm.with_structured_output(ValidationResult)
+    prompt = PromptTemplate(
+        template="Verify these facts: {facts}\nSource: {source}\n\n{format_instructions}",
+        input_variables=["facts", "source"],
+        partial_variables={"format_instructions": val_parser.get_format_instructions()}
+    )
     
-    prompt = f"""
-    You are a Fact Checker. Compare these 'Extracted Facts' against the 'Source Text'.
-    Remove any fact that is not explicitly supported by the Source Text.
-    
-    SOURCE TEXT: {state['current_raw_text']}
-    EXTRACTED FACTS: {state['extracted_facts']}
-    """
-    
-    print(f"⚖️ Validating facts for accuracy...")
-    res = await llm_struct.ainvoke(prompt)
-    return {"extracted_facts": res.cleaned_facts}
+    chain = prompt | llm | val_parser
+    print(f"⚖️ Validating...")
+    try:
+        res = await chain.ainvoke({"facts": state['extracted_facts'], "source": state['current_raw_text']})
+        return {"extracted_facts": res.cleaned_facts}
+    except:
+        return {"extracted_facts": state['extracted_facts']}
 
 def save_cleaned_data_node(state: CleanerState):
     article = state["raw_articles"][0]
     session = SessionLocal()
     repo = Repository(session)
     
-    cleaned_content = "\n".join([f"• {f}" for f in state["extracted_facts"]]) if not state["is_junk"] else "Junk/No Content"
+    # We save as 'AggregatedSummary' which our 'fetch' logic uses to know it's done.
+    if not state["is_junk"] and state["extracted_facts"]:
+        cleaned_content = "\n".join([f"• {f}" for f in state["extracted_facts"]])
 
-    class CleanedData:
-        article_name = article['title']
-        source_link = article['link']
-        published_date = article['date']
-        summary = cleaned_content 
-        impact_score = 0
-        explanation = "Cleaned by Extraction Agent"
+        # Using your existing class structure for save_aggregated_summary
+        class CleanedData:
+            article_name = article['title']
+            source_link = article['link']
+            published_date = article['date']
+            summary = cleaned_content 
+            impact_score = 0
+            explanation = "Cleaned via Pydantic Parser"
 
-    repo.save_aggregated_summary(CleanedData())
+        repo.save_aggregated_summary(CleanedData())
+        print(f"✅ Saved & Linked: {article['title'][:40]}")
+    else:
+        # Even if it's junk, we should ideally create a record or mark it 
+        # to prevent re-scraping the same junk over and over.
+        print(f"🗑️ Junk ignored: {article['title'][:40]}")
+
     session.close()
-    
-    print(f"✅ Data Cleaned & Saved: {article['title'][:40]}")
     return {"raw_articles": state["raw_articles"][1:], "processed_count": state["processed_count"] + 1}
 
 # --- 4. Graph Construction ---
 
-# 🛡️ DEFINE RETRY POLICY: Handle 429s automatically
-# wait_min: Initial wait time
-# backoff_factor: Multiply wait time on subsequent failures (5s, 10s, 20s...)
-rate_limit_retry = RetryPolicy(
-    max_attempts=3,
-    wait_min=5.0,
-    backoff_factor=2.0
-)
-
 def router(state: CleanerState):
-    if len(state["raw_articles"]) > 0:
-        return "extract"
-    return END
+    return "extract" if state["raw_articles"] else END
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+builder = StateGraph(CleanerState)
+builder.add_node("fetch", fetch_recent_raw_node)
+builder.add_node("extract", extraction_node)
+builder.add_node("validate", validation_node)
+builder.add_node("save", save_cleaned_data_node)
 
-workflow = StateGraph(CleanerState)
+builder.add_edge(START, "fetch")
+builder.add_edge("fetch", "extract")
+builder.add_edge("extract", "validate")
+builder.add_edge("validate", "save")
+builder.add_conditional_edges("save", router)
 
-# Add nodes with the retry policy attached
-workflow.add_node("fetch", fetch_raw_node)
-workflow.add_node("extract", extraction_node, retry=rate_limit_retry)
-workflow.add_node("validate", validation_node, retry=rate_limit_retry)
-workflow.add_node("save", save_cleaned_data_node)
-
-workflow.add_edge(START, "fetch")
-workflow.add_edge("fetch", "extract")
-workflow.add_edge("extract", "validate")
-workflow.add_edge("validate", "save")
-
-workflow.add_conditional_edges("save", router, {"extract": "extract", END: END})
-
-cleaner_agent = workflow.compile()
+cleaner_agent = builder.compile()
 
 if __name__ == "__main__":
-    async def run():
-        await cleaner_agent.ainvoke({"raw_articles": []})
-    asyncio.run(run())
+    asyncio.run(cleaner_agent.ainvoke({"raw_articles": []}))
